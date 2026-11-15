@@ -10,9 +10,13 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading.RateLimiting;
 using Dapper;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Data.SqlClient;
+
+// Creates the admin password hash:  dotnet run -- hash-password "your long password"
+if (args.Length == 2 && args[0] == "hash-password") { Console.WriteLine(Passwords.Hash(args[1])); return; }
 
 var b = WebApplication.CreateBuilder(args);
 var cfg = b.Configuration;
@@ -20,15 +24,18 @@ var cs = cfg.GetConnectionString("Default") ?? throw new InvalidOperationExcepti
 var pf = new PayFast(cfg["PayFast:MerchantId"]!, cfg["PayFast:MerchantKey"]!, cfg["PayFast:Passphrase"] ?? "", cfg.GetValue<bool>("PayFast:Sandbox"));
 var site = cfg["PublicSiteUrl"]!.TrimEnd('/');
 var api = cfg["PublicApiUrl"]!.TrimEnd('/');
+var adminHash = cfg["Admin:PasswordHash"] ?? "";
 
 b.WebHost.ConfigureKestrel(k => { k.AddServerHeader = false; k.Limits.MaxRequestBodySize = 32 * 1024; });
 b.Services.AddHttpClient();
 b.Services.Configure<ForwardedHeadersOptions>(o => { o.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto; o.KnownNetworks.Clear(); o.KnownProxies.Clear(); });
-b.Services.AddCors(o => o.AddDefaultPolicy(p => p.WithOrigins(site).WithMethods("GET", "POST").WithHeaders("Content-Type")));
+b.Services.AddCors(o => o.AddDefaultPolicy(p => p.WithOrigins(site).WithMethods("GET", "POST").WithHeaders("Content-Type", "Authorization")));
 b.Services.AddRateLimiter(o => {
     o.RejectionStatusCode = 429;
     o.AddPolicy("api", c => RateLimitPartition.GetFixedWindowLimiter(c.Connection.RemoteIpAddress?.ToString() ?? "x",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 20, Window = TimeSpan.FromMinutes(1) }));
+    o.AddPolicy("login", c => RateLimitPartition.GetFixedWindowLimiter("login-" + (c.Connection.RemoteIpAddress?.ToString() ?? "x"),
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 5, Window = TimeSpan.FromMinutes(1) }));
 });
 
 var app = b.Build();
@@ -102,6 +109,32 @@ app.MapPost("/api/payments/notify", async (HttpRequest r, IHttpClientFactory hf)
     return Results.Ok();
 });
 
+// ---- Admin: password login gives a 2-hour token, which the orders list requires ----
+app.MapPost("/api/admin/login", async (LoginIn l, IDataProtectionProvider dp) => {
+    await Task.Delay(300);                                   // slows down password guessing
+    if (adminHash == "" || !Passwords.Verify(l.Password ?? "", adminHash)) return Results.Unauthorized();
+    return Results.Ok(new { token = dp.CreateProtector("coolbuddies.admin").ToTimeLimitedDataProtector().Protect("admin", TimeSpan.FromHours(2)) });
+}).RequireRateLimiting("login");
+
+var admin = app.MapGroup("/api/admin").RequireRateLimiting("api").AddEndpointFilter(async (ctx, next) => {
+    var auth = ctx.HttpContext.Request.Headers.Authorization.ToString();
+    try {
+        var dp = ctx.HttpContext.RequestServices.GetRequiredService<IDataProtectionProvider>();
+        if (auth.StartsWith("Bearer ") && dp.CreateProtector("coolbuddies.admin").ToTimeLimitedDataProtector().Unprotect(auth[7..]) == "admin")
+            return await next(ctx);
+    } catch { }
+    return Results.Unauthorized();
+});
+
+admin.MapGet("/orders", async (string? status) => {
+    await using var db = new SqlConnection(cs);
+    return Results.Ok(await db.QueryAsync<AdminOrder>(
+        @"SELECT TOP 200 o.Id, o.FirstName + ' ' + o.LastName AS Customer, o.Email, o.Phone, o.Address, o.Notes, o.Total, o.Status, o.CreatedAt, o.PaidAt,
+                 (SELECT STRING_AGG(CONCAT(p.Name, ' x', i.Qty), ', ') FROM OrderItems i JOIN Products p ON p.Id = i.ProductId WHERE i.OrderId = o.Id) AS Items
+          FROM Orders o WHERE (@status IS NULL OR o.Status = @status) ORDER BY o.Id DESC",
+        new { status = (status is "Pending" or "Paid" or "Failed") ? status : null }));
+});
+
 app.Run();
 
 static string Enc(string s) => Uri.EscapeDataString(s).Replace("%20", "+").Replace("~", "%7E");
@@ -111,6 +144,8 @@ record Item(int ProductId, int Qty);
 record Prod(int Id, string Name, decimal Price);
 record ProductOut(int Id, string Name, string? Description, decimal Price);
 record OrderRow(int Id, decimal Total);
+record LoginIn(string? Password);
+record AdminOrder(int Id, string Customer, string Email, string Phone, string? Address, string? Notes, decimal Total, string Status, DateTime CreatedAt, DateTime? PaidAt, string? Items);
 record OrderIn(string FirstName, string LastName, string Email, string Phone, string? Address, string? Notes, List<Item> Items) {
     public string? Validate() {
         if (Items is null || Items.Count is 0 or > 10 || Items.Any(i => i.Qty is < 1 or > 10) || Items.Select(i => i.ProductId).Distinct().Count() != Items.Count) return "Invalid items";
@@ -135,5 +170,19 @@ class PayFast(string id, string key, string pass, bool sandbox) {
         if (pass != "") s += "&passphrase=" + Enc(pass);
         f["signature"] = Convert.ToHexString(MD5.HashData(Encoding.UTF8.GetBytes(s))).ToLowerInvariant();
         return f;
+    }
+}
+
+static class Passwords {
+    public static string Hash(string pw) {
+        var salt = RandomNumberGenerator.GetBytes(16);
+        var h = Rfc2898DeriveBytes.Pbkdf2(pw, salt, 210000, HashAlgorithmName.SHA256, 32);
+        return $"210000.{Convert.ToBase64String(salt)}.{Convert.ToBase64String(h)}";
+    }
+    public static bool Verify(string pw, string stored) {
+        var p = stored.Split('.');
+        if (p.Length != 3 || !int.TryParse(p[0], out var it)) return false;
+        var h = Rfc2898DeriveBytes.Pbkdf2(pw, Convert.FromBase64String(p[1]), it, HashAlgorithmName.SHA256, 32);
+        return CryptographicOperations.FixedTimeEquals(h, Convert.FromBase64String(p[2]));
     }
 }
