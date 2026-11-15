@@ -45,5 +45,5 @@ CREATE LOGIN coolbuddies_api WITH PASSWORD = 'CHANGE-ME-to-a-long-random-passwor
 CREATE USER coolbuddies_api FOR LOGIN coolbuddies_api;
 GRANT SELECT ON Products TO coolbuddies_api;
 GRANT SELECT, INSERT, UPDATE ON Orders TO coolbuddies_api;
-GRANT INSERT ON OrderItems TO coolbuddies_api;
+GRANT SELECT, INSERT ON OrderItems TO coolbuddies_api;
 GRANT SELECT, INSERT ON Payments TO coolbuddies_api;
