@@ -22,6 +22,12 @@ Website for an air conditioning and refrigeration business, with online ordering
 
 PayFast sends payment confirmations to `PublicApiUrl`, so for end-to-end tests the API must be reachable from the internet (deploy it, or use a tunnel). Keep `PayFast:Sandbox` true until testing is complete.
 
+## Admin orders page
+1. In `api/CoolBuddies.Api`, run `dotnet run -- hash-password "your long password"`. It prints a hash.
+2. Store it: `dotnet user-secrets set "Admin:PasswordHash" "<the hash>"` (on a host, set `Admin__PasswordHash`).
+3. Set `API` at the top of the script in `frontend/admin.html`, serve `frontend/`, open `admin.html` and sign in.
+Sign-in is limited to 5 attempts a minute, and the session ends after 2 hours.
+
 ## Security notes
 - Never commit secrets: connection strings, PayFast keys or passphrase, database passwords.
 - Prices are always read from the database, and orders are only marked paid after PayFast's signature, server confirmation and amount checks pass.
